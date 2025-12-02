@@ -195,6 +195,119 @@ export class MetricsService {
     return `${service.toLowerCase().replace(/\s+/g, '-')}.ibp.network`;
   }
 
+  async updateMetricsForAllMembers(): Promise<void> {
+    // Reset all metrics to start fresh
+    this.memberStatusGauge.reset();
+    this.serviceStatusGauge.reset();
+    this.downtimeEventCounter.reset();
+
+    // Get all members
+    const members = await this.apiClient.getAllMembers();
+
+    // Get downtime events for the last 30 days
+    const endDate = new Date();
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - 30);
+
+    const startDateStr = startDate.toISOString().split('T')[0];
+    const endDateStr = endDate.toISOString().split('T')[0];
+
+    // Process each member
+    for (const member of members) {
+      // Update member status
+      this.memberStatusGauge.set(
+        { member: member.name, region: member.region },
+        member.active ? 1 : 0,
+      );
+
+      // Get downtime events for this member
+      let downtimeEvents: DowntimeEvent[] = [];
+      try {
+        downtimeEvents = await this.apiClient.getDowntimeEvents(
+          member.name,
+          startDateStr,
+          endDateStr,
+        );
+      } catch (error) {
+        console.error(
+          `Error fetching downtime events for ${member.name}:`,
+          error,
+        );
+        continue; // Skip this member if we can't fetch events
+      }
+
+      // Track all unique domain/check combinations we've seen for this member
+      const trackedCombinations = new Set<string>();
+      const servicesWithEvents = new Set<string>();
+
+      // Process downtime events and update metrics
+      for (const event of downtimeEvents) {
+        // Only process events for the current member (safety check)
+        if (event.member_name !== member.name) {
+          continue;
+        }
+
+        const serviceName = this.matchServiceFromDomain(
+          event.domain_name,
+          member.services,
+        );
+        const combinationKey = `${event.domain_name}:${event.check_type}:${event.check_name}`;
+        trackedCombinations.add(combinationKey);
+        servicesWithEvents.add(serviceName);
+
+        // Increment downtime event counter
+        this.downtimeEventCounter.inc({
+          member: member.name,
+          service: serviceName,
+          domain: event.domain_name,
+          check_type: event.check_type,
+          check_name: event.check_name,
+          status: event.status,
+        });
+
+        // Update service status based on event status
+        // If status is "ongoing", the service is down (0), otherwise it's up (1)
+        const status = event.status === 'ongoing' ? 0 : 1;
+        this.serviceStatusGauge.set(
+          {
+            member: member.name,
+            service: serviceName,
+            domain: event.domain_name,
+            check_type: event.check_type,
+            check_name: event.check_name,
+          },
+          status,
+        );
+      }
+
+      // For services that don't have any downtime events, mark them as up if member is active
+      // This ensures all member services appear in metrics
+      if (member.active) {
+        for (const service of member.services) {
+          // Only create default entries for services that don't have any events
+          // Services with events are already tracked above
+          if (!servicesWithEvents.has(service)) {
+            const defaultDomain = this.createDefaultDomain(service);
+            const combinationKey = `${defaultDomain}:default:default`;
+
+            if (!trackedCombinations.has(combinationKey)) {
+              this.serviceStatusGauge.set(
+                {
+                  member: member.name,
+                  service: service,
+                  domain: defaultDomain,
+                  check_type: 'default',
+                  check_name: 'default',
+                },
+                1, // Up (no downtime events and member is active)
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+
   async getMetrics(): Promise<string> {
     return this.registry.metrics();
   }
