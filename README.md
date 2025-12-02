@@ -6,7 +6,7 @@ A Prometheus exporter for the IBP (Interweb Blockchain Providers) GeoDNS API tha
 
 - Tracks member status (active/inactive)
 - Tracks service status (up/down) based on downtime events
-- Exposes Prometheus metrics at `/:memberId/metrics`
+- Exposes Prometheus metrics at `/metrics` (all members) and `/:memberId/metrics` (specific member)
 - Fetches real-time data from the IBP dashboard API
 
 ## Installation
@@ -30,11 +30,34 @@ yarn build
 yarn start:prod
 ```
 
+### Production with PM2
+
+```bash
+# Build the application
+yarn build
+
+# Start with PM2
+yarn pm2:start
+
+# Other PM2 commands
+yarn pm2:stop      # Stop the application
+yarn pm2:restart   # Restart the application
+yarn pm2:logs      # View logs
+yarn pm2:monit     # Monitor the application
+yarn pm2:delete    # Delete from PM2
+```
+
 The application will start on port 3000 by default.
 
 ## Usage
 
-### Metrics Endpoint
+### Metrics Endpoints
+
+Access metrics for all members:
+
+```
+GET http://localhost:3000/metrics
+```
 
 Access metrics for a specific member:
 
@@ -42,9 +65,11 @@ Access metrics for a specific member:
 GET http://localhost:3000/:memberId/metrics
 ```
 
-Example:
+Examples:
 ```
+GET http://localhost:3000/metrics
 GET http://localhost:3000/Gatotech/metrics
+GET http://localhost:3000/Interweb/metrics
 ```
 
 ### Available Metrics
@@ -91,7 +116,21 @@ The downtime events are fetched for the last 30 days by default.
 
 ## Prometheus Configuration
 
-Add this to your `prometheus.yml`:
+### Scrape All Members (Recommended)
+
+Add this to your `prometheus.yml` to scrape metrics for all members:
+
+```yaml
+scrape_configs:
+  - job_name: 'ibp-geodns-exporter'
+    static_configs:
+      - targets: ['localhost:3000']
+    metrics_path: '/metrics'
+```
+
+### Scrape Specific Member
+
+To scrape metrics for a specific member:
 
 ```yaml
 scrape_configs:
@@ -101,20 +140,20 @@ scrape_configs:
     metrics_path: '/Gatotech/metrics'  # Change to desired member
 ```
 
-Or scrape multiple members:
+### Scrape Multiple Specific Members
+
+To scrape multiple specific members:
 
 ```yaml
 scrape_configs:
   - job_name: 'ibp-geodns-exporter'
     static_configs:
       - targets: ['localhost:3000']
-    relabel_configs:
-      - source_labels: [__address__]
-        target_label: __param_member
-      - source_labels: [__param_member]
-        target_label: instance
-      - target_label: __address__
-        replacement: localhost:3000
+    metrics_path: '/Interweb/metrics'
+  - job_name: 'ibp-geodns-exporter-gatotech'
+    static_configs:
+      - targets: ['localhost:3000']
+    metrics_path: '/Gatotech/metrics'
 ```
 
 ## Development
