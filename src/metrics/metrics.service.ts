@@ -1,6 +1,10 @@
 import { Injectable } from '@nestjs/common';
 import { Registry, Gauge, Counter } from 'prom-client';
-import { ApiClientService, DowntimeEvent } from './api-client.service';
+import {
+  ApiClientService,
+  DowntimeEvent,
+  ServiceConfig,
+} from './api-client.service';
 
 @Injectable()
 export class MetricsService {
@@ -16,7 +20,7 @@ export class MetricsService {
     this.memberStatusGauge = new Gauge({
       name: 'ibp_member_status',
       help: 'IBP member status (1 = active/up, 0 = inactive/down)',
-      labelNames: ['member', 'region'],
+      labelNames: ['member', 'region', 'level'],
       registers: [this.registry],
     });
 
@@ -24,7 +28,14 @@ export class MetricsService {
     this.serviceStatusGauge = new Gauge({
       name: 'ibp_service_status',
       help: 'IBP service status (1 = up, 0 = down)',
-      labelNames: ['member', 'service', 'domain', 'check_type', 'check_name'],
+      labelNames: [
+        'member',
+        'service',
+        'domain',
+        'check_type',
+        'check_name',
+        'level',
+      ],
       registers: [this.registry],
     });
 
@@ -58,7 +69,11 @@ export class MetricsService {
 
     // Update member status
     this.memberStatusGauge.set(
-      { member: member.name, region: member.region },
+      {
+        member: member.name,
+        region: member.region,
+        level: member.level.toString(),
+      },
       member.active ? 1 : 0,
     );
 
@@ -120,18 +135,65 @@ export class MetricsService {
           domain: event.domain_name,
           check_type: event.check_type,
           check_name: event.check_name,
+          level: member.level.toString(),
         },
         status,
       );
     }
 
-    // For services that don't have any downtime events, mark them as up if member is active
+    // Get required services for this member's level
+    let requiredServices: Set<string> = new Set();
+    try {
+      const servicesConfig = await this.apiClient.getServicesConfig();
+      requiredServices = this.getRequiredServicesByLevel(
+        member.level,
+        servicesConfig,
+      );
+    } catch (error) {
+      console.error(
+        `Error fetching services config for ${member.name}:`,
+        error,
+      );
+    }
+
+    // For required services that have no downtime events, mark as down
+    // (no stats = missing monitoring = down)
+    for (const requiredService of requiredServices) {
+      if (!servicesWithEvents.has(requiredService)) {
+        // Check if this service is in member.services (they should provide it)
+        if (member.services.includes(requiredService)) {
+          const defaultDomain = this.createDefaultDomain(requiredService);
+          const combinationKey = `${defaultDomain}:required:no-stats`;
+
+          if (!trackedCombinations.has(combinationKey)) {
+            this.serviceStatusGauge.set(
+              {
+                member: member.name,
+                service: requiredService,
+                domain: defaultDomain,
+                check_type: 'required',
+                check_name: 'no-stats',
+                level: member.level.toString(),
+              },
+              0, // Down - required service with no monitoring stats
+            );
+            trackedCombinations.add(combinationKey);
+          }
+        }
+      }
+    }
+
+    // For services that don't have any downtime events and are not required,
+    // mark them as up if member is active
     // This ensures all member services appear in metrics
     if (member.active) {
       for (const service of member.services) {
         // Only create default entries for services that don't have any events
-        // Services with events are already tracked above
-        if (!servicesWithEvents.has(service)) {
+        // and are not required services (required services already handled above)
+        if (
+          !servicesWithEvents.has(service) &&
+          !requiredServices.has(service)
+        ) {
           const defaultDomain = this.createDefaultDomain(service);
           const combinationKey = `${defaultDomain}:default:default`;
 
@@ -143,6 +205,7 @@ export class MetricsService {
                 domain: defaultDomain,
                 check_type: 'default',
                 check_name: 'default',
+                level: member.level.toString(),
               },
               1, // Up (no downtime events and member is active)
             );
@@ -195,6 +258,35 @@ export class MetricsService {
     return `${service.toLowerCase().replace(/\s+/g, '-')}.ibp.network`;
   }
 
+  private mapEndpointToServiceName(endpoint: string): string {
+    // Convert endpoint name to service name format
+    // e.g., "kusama" -> "Kusama", "asset-hub-paseo" -> "Asset-Hub-Paseo"
+    return endpoint
+      .split('-')
+      .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+      .join('-');
+  }
+
+  private getRequiredServicesByLevel(
+    level: number,
+    servicesConfig: ServiceConfig,
+  ): Set<string> {
+    const requiredServices = new Set<string>();
+
+    for (const [, config] of Object.entries(servicesConfig)) {
+      const requiredLevel = parseInt(config.level_required, 10);
+      if (level >= requiredLevel) {
+        // Map endpoint names to service names
+        for (const endpoint of Object.keys(config.endpoints)) {
+          const serviceName = this.mapEndpointToServiceName(endpoint);
+          requiredServices.add(serviceName);
+        }
+      }
+    }
+
+    return requiredServices;
+  }
+
   async updateMetricsForAllMembers(): Promise<void> {
     // Reset all metrics to start fresh
     this.memberStatusGauge.reset();
@@ -203,6 +295,14 @@ export class MetricsService {
 
     // Get all members
     const members = await this.apiClient.getAllMembers();
+
+    // Get services config once for all members
+    let servicesConfig: ServiceConfig | null = null;
+    try {
+      servicesConfig = await this.apiClient.getServicesConfig();
+    } catch (error) {
+      console.error('Error fetching services config:', error);
+    }
 
     // Get downtime events for the last 30 days
     const endDate = new Date();
@@ -216,7 +316,11 @@ export class MetricsService {
     for (const member of members) {
       // Update member status
       this.memberStatusGauge.set(
-        { member: member.name, region: member.region },
+        {
+          member: member.name,
+          region: member.region,
+          level: member.level.toString(),
+        },
         member.active ? 1 : 0,
       );
 
@@ -275,18 +379,59 @@ export class MetricsService {
             domain: event.domain_name,
             check_type: event.check_type,
             check_name: event.check_name,
+            level: member.level.toString(),
           },
           status,
         );
       }
 
-      // For services that don't have any downtime events, mark them as up if member is active
+      // Get required services for this member's level
+      let requiredServices: Set<string> = new Set();
+      if (servicesConfig) {
+        requiredServices = this.getRequiredServicesByLevel(
+          member.level,
+          servicesConfig,
+        );
+      }
+
+      // For required services that have no downtime events, mark as down
+      // (no stats = missing monitoring = down)
+      for (const requiredService of requiredServices) {
+        if (!servicesWithEvents.has(requiredService)) {
+          // Check if this service is in member.services (they should provide it)
+          if (member.services.includes(requiredService)) {
+            const defaultDomain = this.createDefaultDomain(requiredService);
+            const combinationKey = `${defaultDomain}:required:no-stats`;
+
+            if (!trackedCombinations.has(combinationKey)) {
+              this.serviceStatusGauge.set(
+                {
+                  member: member.name,
+                  service: requiredService,
+                  domain: defaultDomain,
+                  check_type: 'required',
+                  check_name: 'no-stats',
+                  level: member.level.toString(),
+                },
+                0, // Down - required service with no monitoring stats
+              );
+              trackedCombinations.add(combinationKey);
+            }
+          }
+        }
+      }
+
+      // For services that don't have any downtime events and are not required,
+      // mark them as up if member is active
       // This ensures all member services appear in metrics
       if (member.active) {
         for (const service of member.services) {
           // Only create default entries for services that don't have any events
-          // Services with events are already tracked above
-          if (!servicesWithEvents.has(service)) {
+          // and are not required services (required services already handled above)
+          if (
+            !servicesWithEvents.has(service) &&
+            !requiredServices.has(service)
+          ) {
             const defaultDomain = this.createDefaultDomain(service);
             const combinationKey = `${defaultDomain}:default:default`;
 
@@ -298,6 +443,7 @@ export class MetricsService {
                   domain: defaultDomain,
                   check_type: 'default',
                   check_name: 'default',
+                  level: member.level.toString(),
                 },
                 1, // Up (no downtime events and member is active)
               );

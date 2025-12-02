@@ -31,6 +31,15 @@ export interface DowntimeEvent {
   status: string;
 }
 
+export interface ServiceConfig {
+  [domain: string]: {
+    service_type: string;
+    level_required: string;
+    endpoints: { [key: string]: string };
+    members: string[];
+  };
+}
+
 @Injectable()
 export class ApiClientService {
   private readonly apiBaseUrl = 'https://ibdash.dotters.network:9000/api';
@@ -66,6 +75,16 @@ export class ApiClientService {
           start: startDate,
           end: endDate,
         },
+      },
+    );
+    return response.data;
+  }
+
+  async getServicesConfig(): Promise<ServiceConfig> {
+    const response = await axios.get<ServiceConfig>(
+      'https://raw.githubusercontent.com/ibp-network/config/refs/heads/main/services.json',
+      {
+        timeout: 10000,
       },
     );
     return response.data;
